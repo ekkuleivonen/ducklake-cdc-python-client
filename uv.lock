@@ -28,6 +28,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "ducklake-client" },
+    { name = "pytz" },
 ]
 
 [package.optional-dependencies]
@@ -44,24 +45,25 @@ polars = [
 
 [package.metadata]
 requires-dist = [
-    { name = "ducklake-client" },
+    { name = "ducklake-client", specifier = ">=0.1.1" },
     { name = "pandas", marker = "extra == 'pandas'" },
     { name = "polars", marker = "extra == 'polars'" },
     { name = "pyarrow", marker = "extra == 'arrow'" },
     { name = "pyarrow", marker = "extra == 'polars'" },
+    { name = "pytz", specifier = ">=2026.2" },
 ]
 provides-extras = ["arrow", "pandas", "polars"]
 
 [[package]]
 name = "ducklake-client"
-version = "0.1.0"
+version = "0.1.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "duckdb" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/bb/76/17ad0af0736a5b6df26197408731fc805a206ffb034f503daa4150d6483f/ducklake_client-0.1.0.tar.gz", hash = "sha256:5fb279c603b029577b2a72286956129ae8887a67872761273e3e83c015d417dd", size = 14214, upload-time = "2026-05-05T03:13:35.087Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/eb/d9/bcff1b00c0a652d75fa631d222b88ccdad6ff69b59e6473172d739ba1638/ducklake_client-0.1.1.tar.gz", hash = "sha256:2551e0320f97c130eca7d1c8807114de320e8ce9d5e4fd65e434ea30ab90f730", size = 14300, upload-time = "2026-05-05T11:49:26.508Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/0b/45/a2ed0534ac2f8f6a5fcd2cb2150044e2f150263c627d7cf7c9ca8c3540f8/ducklake_client-0.1.0-py3-none-any.whl", hash = "sha256:c81d54f9de61a8ca2d77f5526edfc453867abc4d55f40a31c6fde016b956a14f", size = 25379, upload-time = "2026-05-05T03:13:33.756Z" },
+    { url = "https://files.pythonhosted.org/packages/da/77/5ab04082e3c41ed225fbd2f930312902cd1138f5b7368f82e2d8f200c242/ducklake_client-0.1.1-py3-none-any.whl", hash = "sha256:3701b29800d1086569b8cb75325391014af38f5869bfec1179c35d577bec50b4", size = 25469, upload-time = "2026-05-05T11:49:25.672Z" },
 ]
 
 [[package]]
@@ -182,6 +184,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/66/c0/0c8b6ad9f17a802ee498c46e004a0eb49bc148f2fd230864601a86dcf6db/python-dateutil-2.9.0.post0.tar.gz", hash = "sha256:37dd54208da7e1cd875388217d5e00ebd4179249f90fb72437e91a35459a0ad3", size = 342432, upload-time = "2024-03-01T18:36:20.211Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/ec/57/56b9bcc3c9c6a792fcbaf139543cee77261f3651ca9da0c93f5c1221264b/python_dateutil-2.9.0.post0-py2.py3-none-any.whl", hash = "sha256:a8b2bc7bffae282281c8140a97d3aa9c14da0b136dfe83f850eea9a5f7470427", size = 229892, upload-time = "2024-03-01T18:36:18.57Z" },
+]
+
+[[package]]
+name = "pytz"
+version = "2026.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/ff/46/dd499ec9038423421951e4fad73051febaa13d2df82b4064f87af8b8c0c3/pytz-2026.2.tar.gz", hash = "sha256:0e60b47b29f21574376f218fe21abc009894a2321ea16c6754f3cad6eb7cdd6a", size = 320861, upload-time = "2026-05-04T01:35:29.667Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ec/dd/96da98f892250475bdf2328112d7468abdd4acc7b902b6af23f4ed958ea0/pytz-2026.2-py2.py3-none-any.whl", hash = "sha256:04156e608bee23d3792fd45c94ae47fae1036688e75032eea2e3bf0323d1f126", size = 510141, upload-time = "2026-05-04T01:35:27.408Z" },
 ]
 
 [[package]]

@@ -1,140 +1,131 @@
-"""Base sink protocols and convenience classes."""
+"""Small sink primitives for the high-level CDC client."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
+import inspect
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any, Protocol, runtime_checkable
 
-if TYPE_CHECKING:
-    from ducklake_cdc_client.types import (
-        DDLBatch,
-        DDLTickBatch,
-        DMLBatch,
-        DMLTickBatch,
-        SinkContext,
+from ducklake_cdc_client.types import DDLBatch, DDLTickBatch, DMLBatch, DMLTickBatch, SinkContext
+
+type Batch = DMLBatch | DDLBatch | DMLTickBatch | DDLTickBatch
+type SinkLike = Sink | Callable[..., None]
+
+
+@runtime_checkable
+class Sink(Protocol):
+    """A batch destination.
+
+    Users do not need to inherit from this. Any object with ``write(batch, ctx)``
+    works; ``open`` and ``close`` are optional lifecycle hooks. Plain callables
+    are accepted by consumers and are wrapped with :func:`sink`.
+    """
+
+    def write(self, batch: Batch, ctx: SinkContext) -> None: ...
+
+
+@dataclass
+class _CallableSink:
+    fn: Callable[..., None]
+    name: str
+    required: bool = True
+
+    def __post_init__(self) -> None:
+        self._wants_ctx = _callable_wants_context(self.fn)
+
+    def write(self, batch: Batch, ctx: SinkContext) -> None:
+        if self._wants_ctx:
+            self.fn(batch, ctx)
+        else:
+            self.fn(batch)
+
+
+def sink(
+    fn: Callable[..., None],
+    *,
+    name: str | None = None,
+    required: bool = True,
+) -> Sink:
+    """Wrap ``fn(batch)`` or ``fn(batch, ctx)`` as a sink."""
+
+    if not callable(fn):
+        raise TypeError("sink() expects a callable")
+    return _CallableSink(fn=fn, name=name or _callable_name(fn), required=required)
+
+
+def as_sink(value: SinkLike) -> Sink:
+    if hasattr(value, "write"):
+        return value  # type: ignore[return-value]
+    if callable(value):
+        return sink(value)
+    raise TypeError("sink must be callable or expose write(batch, ctx)")
+
+
+def open_sink(value: Sink) -> None:
+    open_ = getattr(value, "open", None)
+    if callable(open_):
+        open_()
+
+
+def close_sink(value: Sink) -> None:
+    close = getattr(value, "close", None)
+    if callable(close):
+        close()
+
+
+def write_sink(value: Sink, batch: Batch, ctx: SinkContext) -> None:
+    value.write(batch, ctx)
+
+
+def sink_required(value: Sink) -> bool:
+    return bool(getattr(value, "required", True))
+
+
+def sink_name(value: object) -> str:
+    name = getattr(value, "name", None)
+    if isinstance(name, str) and name:
+        return name
+    return type(value).__name__
+
+
+def _callable_name(fn: Callable[..., Any]) -> str:
+    name = getattr(fn, "__name__", None)
+    if isinstance(name, str) and name and name != "<lambda>":
+        return name
+    return type(fn).__name__
+
+
+def _callable_wants_context(fn: Callable[..., Any]) -> bool:
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return True
+
+    positional: list[inspect.Parameter] = []
+    saw_var_positional = False
+    for param in sig.parameters.values():
+        if param.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            positional.append(param)
+        elif param.kind is inspect.Parameter.VAR_POSITIONAL:
+            saw_var_positional = True
+
+    required = [p for p in positional if p.default is inspect.Parameter.empty]
+    if saw_var_positional:
+        return True
+    if len(required) > 2:
+        raise TypeError(
+            "callable sink takes at most 2 positional arguments (batch, ctx); "
+            f"{_callable_name(fn)!r} requires {len(required)}"
+        )
+    if len(positional) >= 2:
+        return True
+    if len(positional) == 1:
+        return False
+    raise TypeError(
+        "callable sink must accept (batch) or (batch, ctx); "
+        f"{_callable_name(fn)!r} accepts no positional arguments"
     )
-
-SinkBatchKind = Literal["dml_changes", "ddl_changes", "dml_ticks", "ddl_ticks", "any"]
-
-
-@runtime_checkable
-class DMLSink(Protocol):
-    """Protocol for a sink that consumes DML batches."""
-
-    name: str
-    require_ack: bool
-
-    def open(self) -> None: ...
-
-    def write(self, batch: DMLBatch, ctx: SinkContext) -> None: ...
-
-    def close(self) -> None: ...
-
-
-@runtime_checkable
-class DDLSink(Protocol):
-    """Protocol for a sink that consumes DDL batches."""
-
-    name: str
-    require_ack: bool
-
-    def open(self) -> None: ...
-
-    def write(self, batch: DDLBatch, ctx: SinkContext) -> None: ...
-
-    def close(self) -> None: ...
-
-
-@runtime_checkable
-class DMLTickSink(Protocol):
-    """Protocol for a sink that consumes DML tick batches."""
-
-    name: str
-    require_ack: bool
-
-    def open(self) -> None: ...
-
-    def write(self, batch: DMLTickBatch, ctx: SinkContext) -> None: ...
-
-    def close(self) -> None: ...
-
-
-@runtime_checkable
-class DDLTickSink(Protocol):
-    """Protocol for a sink that consumes DDL tick batches."""
-
-    name: str
-    require_ack: bool
-
-    def open(self) -> None: ...
-
-    def write(self, batch: DDLTickBatch, ctx: SinkContext) -> None: ...
-
-    def close(self) -> None: ...
-
-
-class BaseDMLSink:
-    """Convenience base class for DML sinks."""
-
-    name: str = "sink"
-    require_ack: bool = True
-    batch_kind: SinkBatchKind = "dml_changes"
-
-    def open(self) -> None:
-        return None
-
-    def close(self) -> None:
-        return None
-
-    def write(self, batch: DMLBatch, ctx: SinkContext) -> None:
-        raise NotImplementedError(f"sink {self.name!r} must implement write(batch, ctx)")
-
-
-class BaseDDLSink:
-    """Convenience base class for DDL sinks."""
-
-    name: str = "sink"
-    require_ack: bool = True
-    batch_kind: SinkBatchKind = "ddl_changes"
-
-    def open(self) -> None:
-        return None
-
-    def close(self) -> None:
-        return None
-
-    def write(self, batch: DDLBatch, ctx: SinkContext) -> None:
-        raise NotImplementedError(f"sink {self.name!r} must implement write(batch, ctx)")
-
-
-class BaseDMLTickSink:
-    """Convenience base class for DML tick sinks."""
-
-    name: str = "sink"
-    require_ack: bool = True
-    batch_kind: SinkBatchKind = "dml_ticks"
-
-    def open(self) -> None:
-        return None
-
-    def close(self) -> None:
-        return None
-
-    def write(self, batch: DMLTickBatch, ctx: SinkContext) -> None:
-        raise NotImplementedError(f"sink {self.name!r} must implement write(batch, ctx)")
-
-
-class BaseDDLTickSink:
-    """Convenience base class for DDL tick sinks."""
-
-    name: str = "sink"
-    require_ack: bool = True
-    batch_kind: SinkBatchKind = "ddl_ticks"
-
-    def open(self) -> None:
-        return None
-
-    def close(self) -> None:
-        return None
-
-    def write(self, batch: DDLTickBatch, ctx: SinkContext) -> None:
-        raise NotImplementedError(f"sink {self.name!r} must implement write(batch, ctx)")

@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 
 from ducklake_client import DuckLake
 
+from ducklake_cdc_client.client import CDCClient, DDLTickRow, SchemaChangeRow
 from ducklake_cdc_client.consumers.base import (
     _DEFAULT_LEASE_WAIT_TIMEOUT,
     ConsumerMode,
@@ -16,8 +17,7 @@ from ducklake_cdc_client.consumers.base import (
     StartAt,
     _ConsumerBase,
 )
-from ducklake_cdc_client.lowlevel import CDCClient, DDLTickRow, SchemaChangeRow
-from ducklake_cdc_client.sinks.base import DDLSink, DDLTickSink
+from ducklake_cdc_client.sinks.base import SinkLike
 from ducklake_cdc_client.types import DDLBatch, DDLTick, DDLTickBatch, SchemaChange
 
 
@@ -38,7 +38,7 @@ class DDLConsumer(_ConsumerBase):
         on_exists: OnExists = "use",
         lease_policy: LeasePolicy = "wait",
         lease_wait_timeout: float = _DEFAULT_LEASE_WAIT_TIMEOUT,
-        sinks: Sequence[DDLSink | DDLTickSink] = (),
+        sinks: Sequence[SinkLike] = (),
         client: CDCClient | None = None,
         retry: RetryPolicy | None = None,
     ) -> None:
@@ -86,6 +86,32 @@ class DDLConsumer(_ConsumerBase):
 
         return operation
 
+    def _read_op(
+        self,
+        max_snapshots: int,
+        start_snapshot: int | None,
+        end_snapshot: int | None,
+    ) -> Callable[[], list[SchemaChangeRow] | list[DDLTickRow]]:
+        client = self._require_client()
+        name = self._name
+
+        def operation() -> list[SchemaChangeRow] | list[DDLTickRow]:
+            if self._mode == "ticks":
+                return client.cdc_ddl_ticks_read(
+                    name,
+                    max_snapshots=max_snapshots,
+                    start_snapshot=start_snapshot,
+                    end_snapshot=end_snapshot,
+                )
+            return client.cdc_ddl_changes_read(
+                name,
+                max_snapshots=max_snapshots,
+                start_snapshot=start_snapshot,
+                end_snapshot=end_snapshot,
+            )
+
+        return operation
+
     def _build_batch(
         self, rows: list[SchemaChangeRow] | list[DDLTickRow]
     ) -> DDLBatch | DDLTickBatch:
@@ -125,6 +151,7 @@ class DDLConsumer(_ConsumerBase):
             snapshot_ids=snapshot_ids,
             received_at=datetime.now(UTC),
             changes=changes,
+            _commit=self._commit_snapshot,
         )
 
     def _build_tick_batch(self, rows: list[DDLTickRow]) -> DDLTickBatch:
@@ -153,4 +180,5 @@ class DDLConsumer(_ConsumerBase):
             snapshot_ids=snapshot_ids,
             received_at=datetime.now(UTC),
             ticks=ticks,
+            _commit=self._commit_snapshot,
         )

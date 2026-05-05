@@ -1,27 +1,28 @@
 """Python client for the ducklake-cdc DuckDB extension.
 
-The headline surface is the high-level consumers plus sink protocols:
+The headline surface is consumers plus small sink helpers:
 
-    from ducklake_cdc_client import DMLConsumer, StdoutDMLSink
+    from ducklake_cdc_client import DMLConsumer
 
-    with DMLConsumer(
-        lake, "orders", table="public.orders", mode="changes", sinks=[StdoutDMLSink()]
-    ) as c:
-        c.run()
+    with DMLConsumer(lake, "orders", table="public.orders", mode="changes") as c:
+        for batch in c.batches():
+            process(batch)
+            batch.commit()
 
-DDL events flow through the parallel :class:`DDLConsumer` / :class:`DDLSink`
-surface. Built-in sinks (``Stdout*``, ``File*``, ``Memory*``, ``Callable*``)
-and combinators (``Map*``, ``Filter*``, ``Fanout*``) are dependency-light;
-network/IO sinks live in separate distributions.
+Any callable accepting ``batch`` or ``batch, ctx`` can be used as a sink. Sink
+objects can optionally expose ``open`` / ``close`` lifecycle hooks and a
+``required`` flag; pass sinks when you want ``consumer.run()`` to own the
+delivery loop.
 
-The low-level 1:1 mirror of the SQL extension surface lives at
-``ducklake_cdc_client.lowlevel.CDCClient``. Reach for it when you need raw access
-to the extension's table functions; use the high-level consumers for the
-listen + deliver + commit loop.
+The 1:1 mirror of the SQL extension surface lives at
+``ducklake_cdc_client.client.CDCClient``. Reach for it when you need raw access
+to the extension's table functions; use the high-level consumers for batch
+iteration or sink-driven delivery.
 """
 
 from ducklake_cdc_client._version import __version__
 from ducklake_cdc_client.app import CDCApp, ConsumerHealth
+from ducklake_cdc_client.client import CDCClient
 from ducklake_cdc_client.consumers import DDLConsumer, DMLConsumer
 from ducklake_cdc_client.enums import (
     ChangeType,
@@ -32,32 +33,7 @@ from ducklake_cdc_client.enums import (
     ScopeKind,
     SubscriptionStatus,
 )
-from ducklake_cdc_client.sinks import (
-    BaseDDLSink,
-    BaseDDLTickSink,
-    BaseDMLSink,
-    BaseDMLTickSink,
-    CallableDDLSink,
-    CallableDMLSink,
-    ConsumerSpawner,
-    DDLSink,
-    DDLTickSink,
-    DMLSink,
-    DMLTickSink,
-    FanoutDDLSink,
-    FanoutDMLSink,
-    FileDDLSink,
-    FileDMLSink,
-    FilterDDLSink,
-    FilterDMLSink,
-    MapDDLSink,
-    MapDMLSink,
-    MemoryDDLSink,
-    MemoryDMLSink,
-    SinkBatchKind,
-    StdoutDDLSink,
-    StdoutDMLSink,
-)
+from ducklake_cdc_client.sinks import Batch, Sink, SinkLike, StdoutSink, sink
 from ducklake_cdc_client.types import (
     Change,
     DDLBatch,
@@ -67,28 +43,20 @@ from ducklake_cdc_client.types import (
     DMLTick,
     DMLTickBatch,
     SchemaChange,
-    SinkAck,
     SinkContext,
 )
 
 __all__ = [
-    "BaseDDLSink",
-    "BaseDDLTickSink",
-    "BaseDMLSink",
-    "BaseDMLTickSink",
-    "CallableDDLSink",
-    "CallableDMLSink",
+    "Batch",
     "CDCApp",
+    "CDCClient",
     "Change",
     "ChangeType",
     "ConsumerHealth",
-    "ConsumerSpawner",
     "DDLBatch",
     "DDLConsumer",
     "DDLTick",
     "DDLTickBatch",
-    "DDLTickSink",
-    "DDLSink",
     "DdlEventKind",
     "DdlObjectKind",
     "DiagnosticSeverity",
@@ -96,26 +64,14 @@ __all__ = [
     "DMLConsumer",
     "DMLTick",
     "DMLTickBatch",
-    "DMLTickSink",
-    "DMLSink",
     "EventCategory",
-    "FanoutDDLSink",
-    "FanoutDMLSink",
-    "FileDDLSink",
-    "FileDMLSink",
-    "FilterDDLSink",
-    "FilterDMLSink",
-    "MapDDLSink",
-    "MapDMLSink",
-    "MemoryDDLSink",
-    "MemoryDMLSink",
     "SchemaChange",
-    "SinkBatchKind",
     "ScopeKind",
-    "SinkAck",
+    "Sink",
     "SinkContext",
-    "StdoutDDLSink",
-    "StdoutDMLSink",
+    "SinkLike",
+    "StdoutSink",
     "SubscriptionStatus",
     "__version__",
+    "sink",
 ]

@@ -5,15 +5,23 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from datetime import UTC, datetime
 from types import TracebackType
 from typing import Any, Literal, Self, TypeVar
 
 from ducklake_client import DuckLake, DuckLakeQueryError
 
-from ducklake_cdc_client.lowlevel import CDCClient, ConsumerListEntry
-from ducklake_cdc_client.sinks.base import SinkBatchKind
+from ducklake_cdc_client.client import CDCClient, ConsumerListEntry
+from ducklake_cdc_client.sinks.base import (
+    Sink,
+    as_sink,
+    close_sink,
+    open_sink,
+    sink_name,
+    sink_required,
+    write_sink,
+)
 from ducklake_cdc_client.types import SinkContext
 
 T = TypeVar("T")
@@ -87,13 +95,6 @@ class _ConsumerBase:
     ) -> None:
         if not name:
             raise ValueError(f"{type(self).__name__} requires a non-empty name")
-        if not sinks:
-            raise ValueError(
-                f"{type(self).__name__} requires at least one sink - sinks are "
-                "the only output path. Pass a built-in sink (e.g. "
-                "StdoutDMLSink() or StdoutDDLSink()) if you just want to see "
-                "events."
-            )
         if lease_policy not in ("wait", "takeover", "error"):
             raise ValueError(
                 f"lease_policy must be 'wait', 'takeover', or 'error'; "
@@ -111,8 +112,7 @@ class _ConsumerBase:
         self._on_exists = on_exists
         self._lease_policy: LeasePolicy = lease_policy
         self._lease_wait_timeout = lease_wait_timeout
-        self._sinks: list[Any] = list(sinks)
-        self._validate_sinks()
+        self._sinks: list[Sink] = [as_sink(item) for item in sinks]
         self._client = client
         self._retry_policy = retry
         self._opened = False
@@ -162,7 +162,67 @@ class _ConsumerBase:
         stop_event: threading.Event | None = None,
     ) -> int:
         self._require_open()
+        if not self._sinks:
+            raise RuntimeError(
+                f"{type(self).__name__}.run() requires at least one sink; "
+                "use batches() for manual iteration"
+            )
         delivered = 0
+        for batch in self.batches(
+            infinite=infinite,
+            max_batches=max_batches,
+            timeout_ms=timeout_ms,
+            max_snapshots=max_snapshots,
+            idle_timeout=idle_timeout,
+            stop_event=stop_event,
+        ):
+            self._deliver(batch)
+            batch.commit()
+            delivered += 1
+        return delivered
+
+    def listen(self, *, timeout_ms: int = 1_000, max_snapshots: int = 100) -> Any | None:
+        """Listen for one batch. Returns ``None`` when no rows are available."""
+
+        self._require_open()
+        rows = self._retry(self._listen_op(timeout_ms, max_snapshots))
+        if not rows:
+            return None
+        return self._build_batch(rows)
+
+    def read(
+        self,
+        *,
+        max_snapshots: int = 100,
+        start_snapshot: int | None = None,
+        end_snapshot: int | None = None,
+    ) -> Any | None:
+        """Read one non-blocking batch. Returns ``None`` when no rows are available."""
+
+        self._require_open()
+        rows = self._retry(self._read_op(max_snapshots, start_snapshot, end_snapshot))
+        if not rows:
+            return None
+        return self._build_batch(rows)
+
+    def batches(
+        self,
+        *,
+        infinite: bool = True,
+        max_batches: int = 0,
+        timeout_ms: int = 1_000,
+        max_snapshots: int = 100,
+        idle_timeout: float = 0.0,
+        stop_event: threading.Event | None = None,
+    ) -> Iterator[Any]:
+        """Yield batches from the consumer.
+
+        The caller owns the commit boundary. Call ``batch.commit()`` after
+        successfully processing a yielded batch.
+        """
+
+        self._require_open()
+        yielded = 0
         last_activity = time.monotonic()
         adaptive_window = (
             _AdaptiveSnapshotWindow(max_snapshots) if self._kind == "dml" else None
@@ -170,7 +230,7 @@ class _ConsumerBase:
 
         while True:
             if stop_event is not None and stop_event.is_set():
-                return delivered
+                return
             listen_max_snapshots = (
                 adaptive_window.current
                 if adaptive_window is not None
@@ -183,11 +243,11 @@ class _ConsumerBase:
                 if adaptive_window is not None:
                     adaptive_window.observe_empty()
                 if stop_event is not None and stop_event.is_set():
-                    return delivered
+                    return
                 if not infinite:
-                    return delivered
+                    return
                 if idle_timeout > 0 and (time.monotonic() - last_activity) >= idle_timeout:
-                    return delivered
+                    return
                 continue
 
             last_activity = time.monotonic()
@@ -198,14 +258,13 @@ class _ConsumerBase:
                     snapshot_span=max(1, batch.end_snapshot - batch.start_snapshot + 1),
                     listen_elapsed_ms=listen_elapsed_ms,
                 )
-            self._deliver(batch)
-            self._retry(self._commit_op(batch.end_snapshot))
-            delivered += 1
+            yield batch
+            yielded += 1
 
             if not infinite:
-                return delivered
-            if max_batches > 0 and delivered >= max_batches:
-                return delivered
+                return
+            if max_batches > 0 and yielded >= max_batches:
+                return
 
     def _setup_consumer(self) -> None:
         client = self._require_client()
@@ -292,37 +351,22 @@ class _ConsumerBase:
         opened: list[Any] = []
         try:
             for sink in self._sinks:
-                sink.open()
+                open_sink(sink)
                 opened.append(sink)
         except BaseException:
             for sink in reversed(opened):
                 try:
-                    sink.close()
+                    close_sink(sink)
                 except Exception:
-                    _LOG.exception("error closing sink %r during rollback", _sink_name(sink))
+                    _LOG.exception("error closing sink %r during rollback", sink_name(sink))
             raise
-
-    def _validate_sinks(self) -> None:
-        expected = self._expected_sink_batch_kind()
-        for sink in self._sinks:
-            actual = getattr(sink, "batch_kind", None)
-            if actual is None:
-                actual = f"{self._kind}_changes"
-            if actual == "any":
-                continue
-            if actual != expected:
-                raise TypeError(
-                    f"{type(self).__name__}(mode={self._mode!r}) requires "
-                    f"{expected!r} sinks; got {_sink_name(sink)!r} with "
-                    f"batch_kind={actual!r}"
-                )
 
     def _close_sinks_quietly(self) -> None:
         for sink in reversed(self._sinks):
             try:
-                sink.close()
+                close_sink(sink)
             except Exception:
-                _LOG.exception("error closing sink %r", _sink_name(sink))
+                _LOG.exception("error closing sink %r", sink_name(sink))
 
     def _deliver(self, batch: Any) -> None:
         ctx = SinkContext(
@@ -332,13 +376,13 @@ class _ConsumerBase:
         )
         for sink in self._sinks:
             try:
-                sink.write(batch, ctx)
+                write_sink(sink, batch, ctx)
             except Exception as exc:
-                if getattr(sink, "require_ack", True):
+                if sink_required(sink):
                     raise
                 _LOG.warning(
                     "optional sink %r raised on batch %s: %s",
-                    _sink_name(sink),
+                    sink_name(sink),
                     batch.batch_id,
                     exc,
                 )
@@ -357,6 +401,12 @@ class _ConsumerBase:
             return client.cdc_commit(name, snapshot)
 
         return operation
+
+    def commit(self, batch: Any) -> None:
+        self._commit_snapshot(batch.end_snapshot)
+
+    def _commit_snapshot(self, snapshot: int) -> None:
+        self._retry(self._commit_op(snapshot))
 
     def _retry(self, operation: Callable[[], T]) -> T:
         if self._retry_policy is None:
@@ -384,12 +434,16 @@ class _ConsumerBase:
     def _listen_op(self, timeout_ms: int, max_snapshots: int) -> Callable[[], list[Any]]:
         raise NotImplementedError
 
-    def _build_batch(self, rows: list[Any]) -> Any:
+    def _read_op(
+        self,
+        max_snapshots: int,
+        start_snapshot: int | None,
+        end_snapshot: int | None,
+    ) -> Callable[[], list[Any]]:
         raise NotImplementedError
 
-    def _expected_sink_batch_kind(self) -> SinkBatchKind:
-        return f"{self._kind}_{self._mode}"  # type: ignore[return-value]
-
+    def _build_batch(self, rows: list[Any]) -> Any:
+        raise NotImplementedError
 
 def _lease_is_alive(entry: ConsumerListEntry) -> bool:
     if entry.owner_token is None:
@@ -425,7 +479,3 @@ def _consumer_error_contains(exc: BaseException, consumer_name: str, needle: str
             return True
         current = current.__cause__
     return False
-
-
-def _sink_name(sink: object) -> str:
-    return str(getattr(sink, "name", type(sink).__name__))

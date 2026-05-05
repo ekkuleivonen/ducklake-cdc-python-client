@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 
 from ducklake_client import DuckLake
 
+from ducklake_cdc_client.client import CDCClient, ChangeRow, DMLTickRow
 from ducklake_cdc_client.consumers.base import (
     _DEFAULT_LEASE_WAIT_TIMEOUT,
     ConsumerMode,
@@ -16,8 +17,7 @@ from ducklake_cdc_client.consumers.base import (
     StartAt,
     _ConsumerBase,
 )
-from ducklake_cdc_client.lowlevel import CDCClient, ChangeRow, DMLTickRow
-from ducklake_cdc_client.sinks.base import DMLSink, DMLTickSink
+from ducklake_cdc_client.sinks.base import SinkLike
 from ducklake_cdc_client.types import Change, DMLBatch, DMLTick, DMLTickBatch
 
 
@@ -39,7 +39,7 @@ class DMLConsumer(_ConsumerBase):
         on_exists: OnExists = "use",
         lease_policy: LeasePolicy = "wait",
         lease_wait_timeout: float = _DEFAULT_LEASE_WAIT_TIMEOUT,
-        sinks: Sequence[DMLSink | DMLTickSink] = (),
+        sinks: Sequence[SinkLike] = (),
         client: CDCClient | None = None,
         retry: RetryPolicy | None = None,
     ) -> None:
@@ -94,6 +94,32 @@ class DMLConsumer(_ConsumerBase):
 
         return operation
 
+    def _read_op(
+        self,
+        max_snapshots: int,
+        start_snapshot: int | None,
+        end_snapshot: int | None,
+    ) -> Callable[[], list[ChangeRow] | list[DMLTickRow]]:
+        client = self._require_client()
+        name = self._name
+
+        def operation() -> list[ChangeRow] | list[DMLTickRow]:
+            if self._mode == "ticks":
+                return client.cdc_dml_ticks_read(
+                    name,
+                    max_snapshots=max_snapshots,
+                    start_snapshot=start_snapshot,
+                    end_snapshot=end_snapshot,
+                )
+            return client.cdc_dml_changes_read(
+                name,
+                max_snapshots=max_snapshots,
+                start_snapshot=start_snapshot,
+                end_snapshot=end_snapshot,
+            )
+
+        return operation
+
     def _build_batch(self, rows: list[ChangeRow] | list[DMLTickRow]) -> DMLBatch | DMLTickBatch:
         if self._mode == "ticks":
             return self._build_tick_batch(rows)  # type: ignore[arg-type]
@@ -129,6 +155,7 @@ class DMLConsumer(_ConsumerBase):
             snapshot_ids=snapshot_ids,
             received_at=datetime.now(UTC),
             changes=changes,
+            _commit=self._commit_snapshot,
         )
 
     def _build_tick_batch(self, rows: list[DMLTickRow]) -> DMLTickBatch:
@@ -158,4 +185,5 @@ class DMLConsumer(_ConsumerBase):
             snapshot_ids=snapshot_ids,
             received_at=datetime.now(UTC),
             ticks=ticks,
+            _commit=self._commit_snapshot,
         )

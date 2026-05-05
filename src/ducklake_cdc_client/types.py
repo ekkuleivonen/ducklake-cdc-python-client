@@ -1,27 +1,29 @@
-"""Data shapes and sink protocols for the high-level CDC client.
+"""Data shapes for the high-level CDC client.
 
-Sinks are the only output path from a consumer. A consumer reads a window of
-changes (DML rows or DDL events), packages them into a batch, and hands the
-batch to each attached sink. The sink decides what to do with it.
+Consumers read a window of changes (DML rows or DDL events) and package them
+into a batch. Iterator users process the batch and call ``batch.commit()``.
+Sink users let ``consumer.run()`` deliver and commit batches for them.
 
 Implicit ack/nack is the contract: a sink that returns from ``write`` without
 raising acknowledges the batch. A sink that raises nacks it, and the consumer
 will retry the same batch (no commit happens). Required sinks gate the commit;
-optional sinks (``require_ack=False``) do not.
-
-DML and DDL batches are kept structurally identical but typed separately. A
-type checker will catch a :class:`DDLSink` attached to a :class:`DMLConsumer`
-at construction time, not at first event.
+optional sinks (``required=False``) do not.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
 from ducklake_cdc_client.enums import ChangeType, DdlEventKind, DdlObjectKind
+
+CommitFn = Callable[[int], None]
+
+
+def _unbound_commit(snapshot: int) -> None:
+    raise RuntimeError("batch is not bound to an active consumer")
 
 
 @dataclass(frozen=True)
@@ -158,47 +160,12 @@ class DDLTick:
 
 
 @dataclass(frozen=True)
-class SinkAck:
-    """Result of an explicit ``batch.ack()`` / ``batch.nack()`` call.
+class DMLBatch:
+    """A pre-commit window of DML changes.
 
-    Implicit ack/nack (return / raise from ``write``) is the headline
-    contract; this dataclass exists for sinks that want to record an
-    acknowledgement without raising.
-    """
-
-    sink: str
-    batch_id: str
-    ok: bool = True
-    detail: str | None = None
-
-
-class _BatchMixin:
-    """Shared ack/nack helpers for :class:`DMLBatch` and :class:`DDLBatch`.
-
-    The methods are pure value constructors — they return a :class:`SinkAck`
-    record that callers can log, return, or hand back to the consumer.
-    Implicit ack-on-return / nack-on-raise is still the headline contract;
-    these helpers exist for the rare "fail this without raising" case.
-    """
-
-    batch_id: str
-
-    def ack(self, sink: str, detail: str | None = None) -> SinkAck:
-        return SinkAck(sink=sink, batch_id=self.batch_id, ok=True, detail=detail)
-
-    def nack(self, sink: str, detail: str | None = None) -> SinkAck:
-        return SinkAck(sink=sink, batch_id=self.batch_id, ok=False, detail=detail)
-
-
-@dataclass(frozen=True)
-class DMLBatch(_BatchMixin):
-    """A pre-commit window of DML changes delivered to sinks.
-
-    The consumer commits to the extension only after every required sink
-    returns from ``write`` without raising. ``batch_id`` is stable across
-    retries: a batch with the same ``(consumer_name, start_snapshot,
-    end_snapshot)`` tuple has the same ``batch_id``. Sinks may use
-    ``batch_id`` for crash-recovery dedup.
+    Call ``commit()`` after successful processing. ``batch_id`` is stable
+    across retries: a batch with the same ``(consumer_name, start_snapshot,
+    end_snapshot)`` tuple has the same ``batch_id``.
     """
 
     consumer_name: str
@@ -208,6 +175,7 @@ class DMLBatch(_BatchMixin):
     snapshot_ids: tuple[int, ...]
     received_at: datetime
     changes: tuple[Change, ...]
+    _commit: CommitFn = field(default=_unbound_commit, repr=False, compare=False)
 
     def __iter__(self) -> Iterator[Change]:
         return iter(self.changes)
@@ -219,10 +187,13 @@ class DMLBatch(_BatchMixin):
     def derive_batch_id(consumer_name: str, start_snapshot: int, end_snapshot: int) -> str:
         return f"{consumer_name}/{start_snapshot}-{end_snapshot}"
 
+    def commit(self) -> None:
+        self._commit(self.end_snapshot)
+
 
 @dataclass(frozen=True)
-class DDLBatch(_BatchMixin):
-    """A pre-commit window of DDL events delivered to sinks.
+class DDLBatch:
+    """A pre-commit window of DDL events.
 
     Structurally identical to :class:`DMLBatch` but parameterized over
     :class:`SchemaChange`. ``batch_id`` is stable across retries: a batch
@@ -237,6 +208,7 @@ class DDLBatch(_BatchMixin):
     snapshot_ids: tuple[int, ...]
     received_at: datetime
     changes: tuple[SchemaChange, ...]
+    _commit: CommitFn = field(default=_unbound_commit, repr=False, compare=False)
 
     def __iter__(self) -> Iterator[SchemaChange]:
         return iter(self.changes)
@@ -248,10 +220,13 @@ class DDLBatch(_BatchMixin):
     def derive_batch_id(consumer_name: str, start_snapshot: int, end_snapshot: int) -> str:
         return f"{consumer_name}/{start_snapshot}-{end_snapshot}"
 
+    def commit(self) -> None:
+        self._commit(self.end_snapshot)
+
 
 @dataclass(frozen=True)
-class DMLTickBatch(_BatchMixin):
-    """A pre-commit window of DML ticks delivered to tick sinks."""
+class DMLTickBatch:
+    """A pre-commit window of DML ticks."""
 
     consumer_name: str
     batch_id: str
@@ -260,6 +235,7 @@ class DMLTickBatch(_BatchMixin):
     snapshot_ids: tuple[int, ...]
     received_at: datetime
     ticks: tuple[DMLTick, ...]
+    _commit: CommitFn = field(default=_unbound_commit, repr=False, compare=False)
 
     def __iter__(self) -> Iterator[DMLTick]:
         return iter(self.ticks)
@@ -271,10 +247,13 @@ class DMLTickBatch(_BatchMixin):
     def derive_batch_id(consumer_name: str, start_snapshot: int, end_snapshot: int) -> str:
         return f"{consumer_name}/{start_snapshot}-{end_snapshot}"
 
+    def commit(self) -> None:
+        self._commit(self.end_snapshot)
+
 
 @dataclass(frozen=True)
-class DDLTickBatch(_BatchMixin):
-    """A pre-commit window of DDL ticks delivered to tick sinks."""
+class DDLTickBatch:
+    """A pre-commit window of DDL ticks."""
 
     consumer_name: str
     batch_id: str
@@ -283,6 +262,7 @@ class DDLTickBatch(_BatchMixin):
     snapshot_ids: tuple[int, ...]
     received_at: datetime
     ticks: tuple[DDLTick, ...]
+    _commit: CommitFn = field(default=_unbound_commit, repr=False, compare=False)
 
     def __iter__(self) -> Iterator[DDLTick]:
         return iter(self.ticks)
@@ -293,6 +273,9 @@ class DDLTickBatch(_BatchMixin):
     @staticmethod
     def derive_batch_id(consumer_name: str, start_snapshot: int, end_snapshot: int) -> str:
         return f"{consumer_name}/{start_snapshot}-{end_snapshot}"
+
+    def commit(self) -> None:
+        self._commit(self.end_snapshot)
 
 
 HeartbeatFn = Callable[[], None]

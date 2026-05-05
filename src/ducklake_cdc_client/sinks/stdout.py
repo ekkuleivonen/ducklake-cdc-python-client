@@ -6,41 +6,28 @@ import sys
 from typing import IO
 
 from ducklake_cdc_client.sinks._json import emit, emit_commit, emit_window
-from ducklake_cdc_client.sinks.base import BaseDDLSink, BaseDMLSink
-from ducklake_cdc_client.types import DDLBatch, DMLBatch, SinkContext
+from ducklake_cdc_client.sinks.base import Batch
+from ducklake_cdc_client.types import Change, SchemaChange, SinkContext
 
 
-class StdoutDMLSink(BaseDMLSink):
-    """Emit each DML batch as JSON lines to stdout."""
+class StdoutSink:
+    """Emit each batch as JSON lines."""
 
     name = "stdout"
-    require_ack = True
+    required = True
 
     def __init__(self, *, stream: IO[str] | None = None) -> None:
         self._stream = stream if stream is not None else sys.stdout
 
-    def write(self, batch: DMLBatch, ctx: SinkContext) -> None:
+    def write(self, batch: Batch, ctx: SinkContext) -> None:
         emit_window(self._stream, batch, len(batch))
-        for change in batch:
-            payload = change.to_dict()
-            payload["type"] = "change"
-            emit(self._stream, payload)
-        emit_commit(self._stream, batch)
-
-
-class StdoutDDLSink(BaseDDLSink):
-    """Emit each DDL batch as JSON lines to stdout."""
-
-    name = "stdout"
-    require_ack = True
-
-    def __init__(self, *, stream: IO[str] | None = None) -> None:
-        self._stream = stream if stream is not None else sys.stdout
-
-    def write(self, batch: DDLBatch, ctx: SinkContext) -> None:
-        emit_window(self._stream, batch, len(batch))
-        for event in batch:
-            payload = event.to_dict()
-            payload["type"] = "schema_change"
+        for item in batch:
+            payload = item.to_dict()
+            if isinstance(item, Change):
+                payload["type"] = "change"
+            elif isinstance(item, SchemaChange):
+                payload["type"] = "schema_change"
+            else:
+                payload["type"] = "tick"
             emit(self._stream, payload)
         emit_commit(self._stream, batch)
