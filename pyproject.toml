@@ -4,12 +4,12 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ducklake-cdc-client"
-version = "0.1.2"
+version = "0.5.1"
 description = "Python client helpers for the ducklake-cdc DuckDB extension"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
-    "ducklake-client>=0.1.2",
+    "ducklake-client>=0.5.1",
     "pytz>=2026.2",
 ]
 
