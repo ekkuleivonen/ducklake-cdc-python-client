@@ -9,6 +9,7 @@ from ducklake_cdc_client.client.client import (
     DDLTickRow,
     DMLTickRow,
     SchemaChangeRow,
+    SchemaDiffRow,
 )
 
 __all__ = [
@@ -20,4 +21,5 @@ __all__ = [
     "DDLTickRow",
     "DMLTickRow",
     "SchemaChangeRow",
+    "SchemaDiffRow",
 ]

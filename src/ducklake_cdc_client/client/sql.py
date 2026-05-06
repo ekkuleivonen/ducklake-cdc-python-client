@@ -17,7 +17,7 @@ def table_function_sql(
     for name, value in (named or {}).items():
         if value is None:
             continue
-        rendered_args.append(f"{name} := {_render_value(value)}")
+        rendered_args.append(f"{quote_identifier(name)} := {_render_value(value)}")
     return f"SELECT * FROM {function_name}({', '.join(rendered_args)})"
 
 
@@ -46,3 +46,7 @@ def _render_value(value: object, *, null_type: str | None = None) -> str:
 
 def quote_literal(value: object) -> str:
     return "'" + str(value).replace("'", "''") + "'"
+
+
+def quote_identifier(value: object) -> str:
+    return '"' + str(value).replace('"', '""') + '"'

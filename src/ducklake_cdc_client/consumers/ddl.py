@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
+from typing import Any
 
 from ducklake_client import DuckLake
 
@@ -40,6 +41,7 @@ class DDLConsumer(_ConsumerBase):
         lease_wait_timeout: float = _DEFAULT_LEASE_WAIT_TIMEOUT,
         sinks: Sequence[SinkLike] = (),
         client: CDCClient | None = None,
+        connection: Any | None = None,
         retry: RetryPolicy | None = None,
     ) -> None:
         super().__init__(
@@ -52,6 +54,7 @@ class DDLConsumer(_ConsumerBase):
             lease_wait_timeout=lease_wait_timeout,
             sinks=sinks,
             client=client,
+            connection=connection,
             retry=retry,
         )
         self._schemas = list(schemas) if schemas else None
@@ -62,11 +65,15 @@ class DDLConsumer(_ConsumerBase):
             self._name,
             schemas=self._schemas,
             table_names=self._tables,
-            start_at="now",
+            start_at=self._start_at,
         )
 
     def _listen_op(
-        self, timeout_ms: int, max_snapshots: int
+        self,
+        timeout_ms: int,
+        max_snapshots: int,
+        poll_min_ms: int | None,
+        coalesce: bool | None,
     ) -> Callable[[], list[SchemaChangeRow] | list[DDLTickRow]]:
         client = self._require_client()
         name = self._name
@@ -77,11 +84,13 @@ class DDLConsumer(_ConsumerBase):
                     name,
                     timeout_ms=timeout_ms,
                     max_snapshots=max_snapshots,
+                    poll_min_ms=poll_min_ms,
                 )
             return client.cdc_ddl_changes_listen(
                 name,
                 timeout_ms=timeout_ms,
                 max_snapshots=max_snapshots,
+                poll_min_ms=poll_min_ms,
             )
 
         return operation
@@ -152,6 +161,8 @@ class DDLConsumer(_ConsumerBase):
             received_at=datetime.now(UTC),
             changes=changes,
             _commit=self._commit_snapshot,
+            _commit_within=self._commit_snapshot_within,
+            _connection=self._connection,
         )
 
     def _build_tick_batch(self, rows: list[DDLTickRow]) -> DDLTickBatch:
@@ -181,4 +192,6 @@ class DDLConsumer(_ConsumerBase):
             received_at=datetime.now(UTC),
             ticks=ticks,
             _commit=self._commit_snapshot,
+            _commit_within=self._commit_snapshot_within,
+            _connection=self._connection,
         )

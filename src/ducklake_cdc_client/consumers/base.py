@@ -12,7 +12,10 @@ from typing import Any, Literal, Self, TypeVar
 
 from ducklake_client import DuckLake, DuckLakeQueryError
 
-from ducklake_cdc_client.client import CDCClient, ConsumerListEntry
+from ducklake_cdc_client.client import CDCClient, ConsumerListEntry, ConsumerWindow
+from ducklake_cdc_client.client.client import _connection_for_lake
+from ducklake_cdc_client.client.sql import table_function_sql
+from ducklake_cdc_client.retry import retry_on_transient
 from ducklake_cdc_client.sinks.base import (
     Sink,
     as_sink,
@@ -74,6 +77,27 @@ class _AdaptiveSnapshotWindow:
             self.current = min(self.ceiling, max(self.current + 1, self.current * 2))
 
 
+class _PinnedConnectionLake:
+    """Adapter that makes a raw DuckDB connection look like a DuckLake.
+
+    :class:`CDCClient` resolves its connection through ``lake.connection``
+    (or ``lake.raw_connection()``), so any object exposing a
+    ``connection`` attribute satisfies it. Passing one of these lets the
+    caller pin every CDC call (``cdc_dml_consumer_create``, the
+    ``cdc_dml_changes_listen`` long-poll, ``cdc_commit``, heartbeats,
+    consumer listing) to a specific connection -- which is the only way
+    to keep the consumer's lease (anchored on
+    ``(db_pointer, connection_id)``) consistent with a transactional
+    commit the caller drives via :meth:`DMLBatch.commit(conn=...)`.
+    """
+
+    __slots__ = ("connection", "alias")
+
+    def __init__(self, connection: Any, *, alias: str) -> None:
+        self.connection = connection
+        self.alias = alias
+
+
 class _ConsumerBase:
     """Shared lifecycle and run loop for DML and DDL consumers."""
 
@@ -91,6 +115,7 @@ class _ConsumerBase:
         lease_wait_timeout: float = _DEFAULT_LEASE_WAIT_TIMEOUT,
         sinks: Sequence[Any] = (),
         client: CDCClient | None = None,
+        connection: Any | None = None,
         retry: RetryPolicy | None = None,
     ) -> None:
         if not name:
@@ -104,6 +129,12 @@ class _ConsumerBase:
             raise ValueError("lease_wait_timeout must be >= 0")
         if mode not in ("ticks", "changes"):
             raise ValueError(f"mode must be 'ticks' or 'changes'; got {mode!r}")
+        if client is not None and connection is not None:
+            raise ValueError(
+                "pass at most one of `client` or `connection`; supplying both "
+                "is ambiguous (the explicit `client` already pins its own "
+                "connection)"
+            )
 
         self._lake = lake
         self._name = name
@@ -114,8 +145,23 @@ class _ConsumerBase:
         self._lease_wait_timeout = lease_wait_timeout
         self._sinks: list[Sink] = [as_sink(item) for item in sinks]
         self._client = client
-        self._retry_policy = retry
+        self._connection_override = connection
+        # The connection used for every CDC call (listen, cdc_commit,
+        # heartbeat) and exposed via ``consumer.connection``. Resolved
+        # lazily on ``__enter__``; a derived one is closed on
+        # ``__exit__``, an override is left to the caller.
+        self._connection: Any = None
+        self._derived_connection: Any = None
+        # Default to ``retry_on_transient`` so the H-022 first-bootstrap
+        # mutex race and SQLite ``database is locked`` bursts don't leak
+        # to callers. Pass ``retry=no_retry`` to opt out.
+        self._retry_policy: RetryPolicy = retry if retry is not None else retry_on_transient
         self._opened = False
+
+    def _effective_retry(self, retry: RetryPolicy | None) -> RetryPolicy:
+        """Use per-call ``retry`` override when provided, else the consumer default."""
+
+        return self._retry_policy if retry is None else retry
 
     @property
     def name(self) -> str:
@@ -130,17 +176,76 @@ class _ConsumerBase:
             )
         return self._client
 
+    @property
+    def connection(self) -> Any:
+        """The DuckDB connection backing every CDC call this consumer makes.
+
+        Pinned by the consumer at ``__enter__`` time -- either an
+        explicit override passed via ``connection=`` (caller owns
+        lifecycle) or one derived from ``lake.connection.cursor()``
+        (consumer owns lifecycle, closes on ``__exit__``).
+
+        This is the connection the extension's lease lives on, so it's
+        also the only connection from which ``cdc_commit`` will succeed
+        without CDC_BUSY. :meth:`DMLBatch.transaction` uses it
+        automatically -- the property is exposed for callers that need
+        DuckDB APIs not proxied through ``BatchTransaction``.
+        """
+
+        if not self._opened:
+            raise RuntimeError(
+                f"{type(self).__name__}.connection is only available "
+                "inside a `with` block"
+            )
+        return self._connection
+
     def __enter__(self) -> Self:
         if self._client is None:
-            self._client = CDCClient(self._lake)
+            # Always pin every CDC call to one connection so the
+            # extension's lease (anchored on
+            # ``(db_pointer, connection_id)``) and the cursor advance
+            # in ``DMLBatch.transaction`` agree on which connection
+            # holds the lease. Without this, ``cdc_commit`` from a
+            # different connection raises CDC_BUSY.
+            if self._connection_override is not None:
+                self._connection = self._connection_override
+            else:
+                self._connection = self._derive_connection()
+                self._derived_connection = self._connection
+            lake_alias = getattr(self._lake, "alias", "lake")
+            self._client = CDCClient(
+                _PinnedConnectionLake(self._connection, alias=lake_alias),
+                install_extension=False,
+            )
+        else:
+            # An explicit ``client`` override owns its own connection;
+            # mirror it onto ``self._connection`` so consumer.connection
+            # and BatchTransaction still resolve to the lease holder.
+            self._connection = _connection_for_lake(self._client.lake)
         try:
             self._retry(self._setup_and_apply_lease_policy)
             self._open_sinks()
             self._opened = True
         except BaseException:
             self._close_sinks_quietly()
+            self._close_derived_connection()
             raise
         return self
+
+    def open(self) -> Self:
+        """Open this consumer and return it.
+
+        This is the explicit-method form of ``with DMLConsumer(...) as consumer``.
+        It is useful when an application needs to swap in a successor consumer
+        during a long-running loop.
+        """
+
+        return self.__enter__()
+
+    def close(self) -> None:
+        """Close this consumer and release resources held by the wrapper."""
+
+        self.__exit__(None, None, None)
 
     def __exit__(
         self,
@@ -150,6 +255,45 @@ class _ConsumerBase:
     ) -> None:
         self._opened = False
         self._close_sinks_quietly()
+        self._close_derived_connection()
+
+    def _derive_connection(self) -> Any:
+        """Open a fresh DuckDB connection on the lake.
+
+        ``lake.connection.cursor()`` returns a sibling connection in
+        duckdb-python: same database, independent transaction state and
+        independent ``connection_id`` (and therefore independent CDC
+        lease identity). That's exactly what we need for a
+        consumer-owned connection.
+        """
+
+        base = getattr(self._lake, "connection", None)
+        if base is None:
+            raise TypeError(
+                f"{type(self).__name__} requires `lake.connection` to "
+                "derive a dedicated consumer connection (or pass "
+                "`connection=` / `client=` explicitly)"
+            )
+        cursor_factory = getattr(base, "cursor", None)
+        if not callable(cursor_factory):
+            raise TypeError(
+                f"{type(self).__name__} requires `lake.connection.cursor()` "
+                "to derive a dedicated consumer connection"
+            )
+        return cursor_factory()
+
+    def _close_derived_connection(self) -> None:
+        if self._derived_connection is None:
+            return
+        connection = self._derived_connection
+        self._derived_connection = None
+        close = getattr(connection, "close", None)
+        if not callable(close):
+            return
+        try:
+            close()
+        except Exception:
+            _LOG.exception("error closing derived consumer connection")
 
     def run(
         self,
@@ -158,8 +302,11 @@ class _ConsumerBase:
         max_batches: int = 0,
         timeout_ms: int = 1_000,
         max_snapshots: int = 100,
+        poll_min_ms: int | None = None,
+        coalesce: bool | None = None,
         idle_timeout: float = 0.0,
         stop_event: threading.Event | None = None,
+        retry: RetryPolicy | None = None,
     ) -> int:
         self._require_open()
         if not self._sinks:
@@ -173,19 +320,35 @@ class _ConsumerBase:
             max_batches=max_batches,
             timeout_ms=timeout_ms,
             max_snapshots=max_snapshots,
+            poll_min_ms=poll_min_ms,
+            coalesce=coalesce,
             idle_timeout=idle_timeout,
             stop_event=stop_event,
+            retry=retry,
         ):
             self._deliver(batch)
             batch.commit()
             delivered += 1
         return delivered
 
-    def listen(self, *, timeout_ms: int = 1_000, max_snapshots: int = 100) -> Any | None:
-        """Listen for one batch. Returns ``None`` when no rows are available."""
+    def listen(
+        self,
+        *,
+        timeout_ms: int = 1_000,
+        max_snapshots: int = 100,
+        poll_min_ms: int | None = None,
+        coalesce: bool | None = None,
+        retry: RetryPolicy | None = None,
+    ) -> Any | None:
+        """Listen for one batch. Returns ``None`` when no rows are available.
+
+        ``retry`` overrides the consumer's constructor retry policy for this listen only.
+        """
 
         self._require_open()
-        rows = self._retry(self._listen_op(timeout_ms, max_snapshots))
+        rows = self._effective_retry(retry)(
+            self._listen_op(timeout_ms, max_snapshots, poll_min_ms, coalesce)
+        )
         if not rows:
             return None
         return self._build_batch(rows)
@@ -196,14 +359,27 @@ class _ConsumerBase:
         max_snapshots: int = 100,
         start_snapshot: int | None = None,
         end_snapshot: int | None = None,
+        retry: RetryPolicy | None = None,
     ) -> Any | None:
-        """Read one non-blocking batch. Returns ``None`` when no rows are available."""
+        """Read one non-blocking batch. Returns ``None`` when no rows are available.
+
+        ``retry`` overrides the consumer's constructor retry policy for this read only.
+        """
 
         self._require_open()
-        rows = self._retry(self._read_op(max_snapshots, start_snapshot, end_snapshot))
+        rows = self._effective_retry(retry)(
+            self._read_op(max_snapshots, start_snapshot, end_snapshot)
+        )
         if not rows:
             return None
         return self._build_batch(rows)
+
+    def window(self, *, max_snapshots: int = 100) -> ConsumerWindow:
+        """Return the consumer's next durable window without materializing rows."""
+
+        self._require_open()
+        client = self._require_client()
+        return self._retry(lambda: client.cdc_window(self._name, max_snapshots=max_snapshots))
 
     def batches(
         self,
@@ -212,13 +388,47 @@ class _ConsumerBase:
         max_batches: int = 0,
         timeout_ms: int = 1_000,
         max_snapshots: int = 100,
+        poll_min_ms: int | None = None,
+        coalesce: bool | None = None,
         idle_timeout: float = 0.0,
         stop_event: threading.Event | None = None,
+        drain_event: threading.Event | None = None,
+        drain_idle_timeout: float = 2.0,
+        retry: RetryPolicy | None = None,
     ) -> Iterator[Any]:
         """Yield batches from the consumer.
 
-        The caller owns the commit boundary. Call ``batch.commit()`` after
-        successfully processing a yielded batch.
+        The caller owns the commit boundary. Call ``batch.commit()``
+        after successfully processing a yielded batch (or use
+        ``batch.transaction()`` for atomic sink-write + commit).
+
+        Shutdown signaling has two flavors:
+
+        - ``stop_event`` is the panic button: when it fires, this
+          generator returns *immediately* the next time it checks --
+          before the next listen call and right after a listen
+          returns. Use it for "operator hit Ctrl-C, abandon any
+          in-flight work."
+        - ``drain_event`` is the polite request: when it fires, the
+          generator keeps polling listen so the consumer drains any
+          batches the upstream has committed, then returns when listen
+          has been idle for ``drain_idle_timeout`` seconds. Use it for
+          "the producer has stopped, let the cursor catch up, then
+          we'll join the thread." Combined with ``stop_event``, drain
+          becomes a bounded wait: the runner sets ``drain_event``,
+          waits a few seconds, then sets ``stop_event`` to force exit
+          on any laggard.
+
+        ``idle_timeout`` is the older, drain-event-less knob: when
+        ``drain_event`` is ``None``, an idle window of >=
+        ``idle_timeout`` seconds also returns. Kept for one-shot
+        "consume what's available, then exit" callers. When
+        ``drain_event`` is provided, ``drain_idle_timeout`` takes
+        precedence (only after ``drain_event`` fires).
+
+        ``retry`` overrides the consumer's constructor ``retry`` policy for
+        listen calls in this iterator only (e.g. :func:`no_retry` during
+        shutdown drains).
         """
 
         self._require_open()
@@ -237,7 +447,9 @@ class _ConsumerBase:
                 else max_snapshots
             )
             listen_started = time.perf_counter()
-            rows = self._retry(self._listen_op(timeout_ms, listen_max_snapshots))
+            rows = self._effective_retry(retry)(
+                self._listen_op(timeout_ms, listen_max_snapshots, poll_min_ms, coalesce)
+            )
             listen_elapsed_ms = (time.perf_counter() - listen_started) * 1_000.0
             if not rows:
                 if adaptive_window is not None:
@@ -246,7 +458,17 @@ class _ConsumerBase:
                     return
                 if not infinite:
                     return
-                if idle_timeout > 0 and (time.monotonic() - last_activity) >= idle_timeout:
+                idle_for = time.monotonic() - last_activity
+                # Drain mode: caller has signaled "no more upstream
+                # writes are coming; exit once you've been idle long
+                # enough to be confident the cursor is caught up."
+                if drain_event is not None and drain_event.is_set():
+                    if idle_for >= drain_idle_timeout:
+                        return
+                # Legacy idle_timeout for callers not using drain_event.
+                # Kept so existing ``batches(idle_timeout=N)`` users
+                # don't have to migrate.
+                elif idle_timeout > 0 and idle_for >= idle_timeout:
                     return
                 continue
 
@@ -298,8 +520,6 @@ class _ConsumerBase:
 
     def _create_and_position(self, client: CDCClient) -> None:
         self._create_consumer(client)
-        if self._start_at != "now":
-            client.cdc_consumer_reset(self._name, to_snapshot=self._start_at)
 
     def _apply_lease_policy(self) -> None:
         client = self._require_client()
@@ -402,15 +622,45 @@ class _ConsumerBase:
 
         return operation
 
+    def _commit_within_op(self, conn: Any, snapshot: int) -> Callable[[], object]:
+        """Build a no-arg op that runs ``cdc_commit`` on the caller's connection.
+
+        Used by :meth:`DMLBatch.commit(conn=...)` so the cursor advance
+        joins whatever transaction the caller has open on ``conn``.
+        Going through :func:`table_function_sql` keeps the rendered SQL
+        identical to what :meth:`CDCClient.cdc_commit` emits, so any
+        future SQL-level changes (escaping rules, named-arg binding,
+        etc.) apply to both paths automatically.
+        """
+
+        catalog = self._require_client().catalog
+        name = self._name
+        sql = table_function_sql("cdc_commit", catalog, name, int(snapshot))
+
+        def operation() -> object:
+            cursor = conn.execute(sql)
+            fetchone = getattr(cursor, "fetchone", None)
+            if callable(fetchone):
+                fetchone()
+            return None
+
+        return operation
+
     def commit(self, batch: Any) -> None:
         self._commit_snapshot(batch.end_snapshot)
 
     def _commit_snapshot(self, snapshot: int) -> None:
         self._retry(self._commit_op(snapshot))
 
+    def _commit_snapshot_within(self, conn: Any, snapshot: int) -> None:
+        # Same retry policy as the consumer's own connection path. A
+        # transient lock retry inside the caller's BEGIN is safe: the
+        # second attempt either succeeds or raises non-transiently, and
+        # the caller's exception handler can ROLLBACK and replay the
+        # whole batch from listen() either way.
+        self._retry(self._commit_within_op(conn, snapshot))
+
     def _retry(self, operation: Callable[[], T]) -> T:
-        if self._retry_policy is None:
-            return operation()
         return self._retry_policy(operation)  # type: ignore[return-value]
 
     def _require_open(self) -> None:
@@ -431,7 +681,13 @@ class _ConsumerBase:
     def _create_consumer(self, client: CDCClient) -> None:
         raise NotImplementedError
 
-    def _listen_op(self, timeout_ms: int, max_snapshots: int) -> Callable[[], list[Any]]:
+    def _listen_op(
+        self,
+        timeout_ms: int,
+        max_snapshots: int,
+        poll_min_ms: int | None,
+        coalesce: bool | None,
+    ) -> Callable[[], list[Any]]:
         raise NotImplementedError
 
     def _read_op(

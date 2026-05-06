@@ -30,6 +30,7 @@ from ducklake_client import DuckLake, DuckLakeQueryError
 
 from ducklake_cdc_client.client.sql import scalar_function_sql, table_function_sql
 from ducklake_cdc_client.enums import ChangeType, DdlEventKind, DdlObjectKind
+from ducklake_cdc_client.prewarm import prewarm as _cdc_prewarm_connection
 
 #: Top-level columns the typed DML read emits in addition to the table's
 #: own columns. Anything *not* in this set is treated as a user-table column
@@ -139,6 +140,43 @@ class SchemaChangeRow:
             details=_optional_str(row.get("details")),
             start_snapshot=_optional_int(row.get("start_snapshot")),
             end_snapshot=_optional_int(row.get("end_snapshot")),
+        )
+
+
+@dataclass(frozen=True)
+class SchemaDiffRow:
+    """One row from ``cdc_schema_diff``."""
+
+    snapshot_id: int
+    snapshot_time: datetime | None
+    change_kind: str
+    column_id: int | None
+    old_name: str | None
+    new_name: str | None
+    old_type: str | None
+    new_type: str | None
+    old_default: str | None
+    new_default: str | None
+    old_nullable: bool | None
+    new_nullable: bool | None
+    parent_column_id: int | None
+
+    @classmethod
+    def from_row(cls, row: Mapping[str, Any]) -> SchemaDiffRow:
+        return cls(
+            snapshot_id=int(row["snapshot_id"]),
+            snapshot_time=_optional_datetime(row.get("snapshot_time")),
+            change_kind=str(row["change_kind"]),
+            column_id=_optional_int(row.get("column_id")),
+            old_name=_optional_str(row.get("old_name")),
+            new_name=_optional_str(row.get("new_name")),
+            old_type=_optional_str(row.get("old_type")),
+            new_type=_optional_str(row.get("new_type")),
+            old_default=_optional_str(row.get("old_default")),
+            new_default=_optional_str(row.get("new_default")),
+            old_nullable=_optional_bool(row.get("old_nullable")),
+            new_nullable=_optional_bool(row.get("new_nullable")),
+            parent_column_id=_optional_int(row.get("parent_column_id")),
         )
 
 
@@ -255,7 +293,24 @@ class CDCClient:
 
     Used internally by :class:`ducklake_cdc_client.DMLConsumer` and
     :class:`ducklake_cdc_client.DDLConsumer`. Available as an escape hatch for users
-    who need the raw extension semantics.
+    who need the raw extension's semantics.
+
+    Parameters
+    ----------
+    lake
+        Attached :class:`ducklake_client.DuckLake` or another object whose
+        connection will run CDC SQL.
+    catalog
+        Catalog alias passed to ``cdc_*`` table functions (default: ``lake.alias``).
+    install_extension
+        When ``True``, runs ``INSTALL`` / ``LOAD`` for ``ducklake_cdc`` from
+        ``extension_repository``.
+    extension_repository
+        DuckDB extension repo name (default ``community``).
+    prewarm_connection
+        When ``True``, runs :func:`ducklake_cdc_client.prewarm` on the resolved
+        connection after optional ``INSTALL`` / ``LOAD``.
+        Mitigates H-022 bootstrap races; set ``False`` only when you already prewarmed this handle.
     """
 
     def __init__(
@@ -265,14 +320,18 @@ class CDCClient:
         catalog: str | None = None,
         install_extension: bool = True,
         extension_repository: str = "community",
+        prewarm_connection: bool = True,
     ) -> None:
         self.lake = lake
         self.catalog = catalog or getattr(lake, "alias", "lake")
+        self.schema = _SchemaNamespace(self)
         if install_extension:
             _install_and_load_extension(lake, repository=extension_repository)
+        if prewarm_connection:
+            _cdc_prewarm_connection(_connection_for_lake(lake))
 
     def version(self) -> str:
-        return str(self.lake.sql(scalar_function_sql("cdc_version")).scalar())
+        return str(_query_on_lake(self.lake, scalar_function_sql("cdc_version")).scalar())
 
     def cdc_dml_consumer_create(
         self,
@@ -368,6 +427,8 @@ class CDCClient:
         *,
         timeout_ms: int = 1_000,
         max_snapshots: int = 100,
+        poll_min_ms: int | None = None,
+        coalesce: bool | None = None,
     ) -> list[ChangeRow]:
         """Block-listen for the next window of DML changes for ``name``.
 
@@ -377,14 +438,12 @@ class CDCClient:
         at the top level (folded into :attr:`ChangeRow.values`).
         """
 
-        rows = self._call(
-            "cdc_dml_changes_listen",
-            name,
-            named={
-                "timeout_ms": timeout_ms,
-                "max_snapshots": max_snapshots,
-            },
-        ).list()
+        named: dict[str, Any] = {"timeout_ms": timeout_ms, "max_snapshots": max_snapshots}
+        if poll_min_ms is not None:
+            named["poll_min_ms"] = poll_min_ms
+        if coalesce is not None:
+            named["coalesce"] = coalesce
+        rows = self._call("cdc_dml_changes_listen", name, named=named).list()
         return [ChangeRow.from_row(row) for row in rows]
 
     def cdc_dml_changes_read(
@@ -424,15 +483,15 @@ class CDCClient:
         *,
         timeout_ms: int = 1_000,
         max_snapshots: int = 100,
+        poll_min_ms: int | None = None,
+        coalesce: bool | None = None,
     ) -> list[DMLTickRow]:
-        rows = self._call(
-            "cdc_dml_ticks_listen",
-            name,
-            named={
-                "timeout_ms": timeout_ms,
-                "max_snapshots": max_snapshots,
-            },
-        ).list()
+        named: dict[str, Any] = {"timeout_ms": timeout_ms, "max_snapshots": max_snapshots}
+        if poll_min_ms is not None:
+            named["poll_min_ms"] = poll_min_ms
+        if coalesce is not None:
+            named["coalesce"] = coalesce
+        rows = self._call("cdc_dml_ticks_listen", name, named=named).list()
         return [DMLTickRow.from_row(row) for row in rows]
 
     def cdc_dml_ticks_read(
@@ -507,15 +566,12 @@ class CDCClient:
         *,
         timeout_ms: int = 1_000,
         max_snapshots: int = 100,
+        poll_min_ms: int | None = None,
     ) -> list[SchemaChangeRow]:
-        rows = self._call(
-            "cdc_ddl_changes_listen",
-            name,
-            named={
-                "timeout_ms": timeout_ms,
-                "max_snapshots": max_snapshots,
-            },
-        ).list()
+        named: dict[str, Any] = {"timeout_ms": timeout_ms, "max_snapshots": max_snapshots}
+        if poll_min_ms is not None:
+            named["poll_min_ms"] = poll_min_ms
+        rows = self._call("cdc_ddl_changes_listen", name, named=named).list()
         return [SchemaChangeRow.from_row(row) for row in rows]
 
     def cdc_ddl_changes_read(
@@ -543,15 +599,12 @@ class CDCClient:
         *,
         timeout_ms: int = 1_000,
         max_snapshots: int = 100,
+        poll_min_ms: int | None = None,
     ) -> list[DDLTickRow]:
-        rows = self._call(
-            "cdc_ddl_ticks_listen",
-            name,
-            named={
-                "timeout_ms": timeout_ms,
-                "max_snapshots": max_snapshots,
-            },
-        ).list()
+        named: dict[str, Any] = {"timeout_ms": timeout_ms, "max_snapshots": max_snapshots}
+        if poll_min_ms is not None:
+            named["poll_min_ms"] = poll_min_ms
+        rows = self._call("cdc_ddl_ticks_listen", name, named=named).list()
         return [DDLTickRow.from_row(row) for row in rows]
 
     def cdc_ddl_ticks_read(
@@ -583,6 +636,25 @@ class CDCClient:
             args.append(to_snapshot)
         rows = self._call("cdc_ddl_ticks_query", *args).list()
         return [DDLTickRow.from_row(row) for row in rows]
+
+    def cdc_schema_diff(
+        self,
+        schema_name: str,
+        table_name: str,
+        from_snapshot: int,
+        to_snapshot: int,
+    ) -> list[SchemaDiffRow]:
+        rows = _query_on_lake(
+            self.lake,
+            table_function_sql(
+                "cdc_schema_diff",
+                schema_name,
+                table_name,
+                from_snapshot,
+                to_snapshot,
+            ),
+        ).list()
+        return [SchemaDiffRow.from_row(row) for row in rows]
 
     def cdc_window(self, name: str, *, max_snapshots: int = 100) -> ConsumerWindow:
         row = self._call(
@@ -684,6 +756,29 @@ def _column_names(cursor: Any) -> list[str]:
 
 def _optional_int(value: Any) -> int | None:
     return None if value is None else int(value)
+
+
+def _optional_bool(value: Any) -> bool | None:
+    return None if value is None else bool(value)
+
+
+class _SchemaNamespace:
+    def __init__(self, client: CDCClient) -> None:
+        self._client = client
+
+    def diff(
+        self,
+        schema_name: str,
+        table_name: str,
+        from_snapshot: int,
+        to_snapshot: int,
+    ) -> list[SchemaDiffRow]:
+        return self._client.cdc_schema_diff(
+            schema_name,
+            table_name,
+            from_snapshot,
+            to_snapshot,
+        )
 
 
 def _int_tuple(value: Any) -> tuple[int, ...]:

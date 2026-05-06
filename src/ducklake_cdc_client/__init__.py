@@ -22,8 +22,8 @@ iteration or sink-driven delivery.
 
 from ducklake_cdc_client._version import __version__
 from ducklake_cdc_client.app import CDCApp, ConsumerHealth
-from ducklake_cdc_client.client import CDCClient
-from ducklake_cdc_client.consumers import DDLConsumer, DMLConsumer
+from ducklake_cdc_client.client import CDCClient, SchemaDiffRow
+from ducklake_cdc_client.consumers import DDLConsumer, DMLConsumer, RetryPolicy
 from ducklake_cdc_client.enums import (
     ChangeType,
     DdlEventKind,
@@ -33,8 +33,11 @@ from ducklake_cdc_client.enums import (
     ScopeKind,
     SubscriptionStatus,
 )
+from ducklake_cdc_client.prewarm import prewarm
+from ducklake_cdc_client.retry import is_transient_error, no_retry, retry_on_transient
 from ducklake_cdc_client.sinks import Batch, Sink, SinkLike, StdoutSink, sink
 from ducklake_cdc_client.types import (
+    BatchTransaction,
     Change,
     DDLBatch,
     DDLTick,
@@ -48,6 +51,7 @@ from ducklake_cdc_client.types import (
 
 __all__ = [
     "Batch",
+    "BatchTransaction",
     "CDCApp",
     "CDCClient",
     "Change",
@@ -65,7 +69,9 @@ __all__ = [
     "DMLTick",
     "DMLTickBatch",
     "EventCategory",
+    "RetryPolicy",
     "SchemaChange",
+    "SchemaDiffRow",
     "ScopeKind",
     "Sink",
     "SinkContext",
@@ -73,5 +79,9 @@ __all__ = [
     "StdoutSink",
     "SubscriptionStatus",
     "__version__",
+    "is_transient_error",
+    "no_retry",
+    "prewarm",
+    "retry_on_transient",
     "sink",
 ]

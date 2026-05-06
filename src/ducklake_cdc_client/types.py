@@ -12,18 +12,118 @@ optional sinks (``required=False``) do not.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from types import TracebackType
+from typing import Any, Self
 
 from ducklake_cdc_client.enums import ChangeType, DdlEventKind, DdlObjectKind
 
 CommitFn = Callable[[int], None]
+CommitWithinFn = Callable[[Any, int], None]
 
 
 def _unbound_commit(snapshot: int) -> None:
     raise RuntimeError("batch is not bound to an active consumer")
+
+
+def _unbound_commit_within(conn: Any, snapshot: int) -> None:
+    raise RuntimeError("batch is not bound to an active consumer")
+
+
+class BatchTransaction:
+    """Atomic transaction wrapping sink work + the cursor advance.
+
+    Returned from :meth:`DMLBatch.transaction` (and tick variants).
+    Use as a context manager::
+
+        for batch in consumer.batches(stop_event=stop):
+            with batch.transaction() as tx:
+                tx.executemany("INSERT INTO sink VALUES (...)", rows)
+
+    Lifecycle:
+
+    - ``__enter__`` issues ``BEGIN`` on the consumer's connection.
+    - Normal ``__exit__`` issues ``cdc_commit`` then ``COMMIT`` on the
+      same connection. The two are atomic from the catalog's
+      perspective: a crash between them is impossible because they
+      share one BEGIN.
+    - Exceptional ``__exit__`` issues ``ROLLBACK`` and re-raises.
+      Nothing is committed -- the next listen call replays the same
+      batch -> exactly-once.
+
+    The transaction owns the consumer's connection for its lifetime;
+    do not run other queries on ``consumer.connection`` until the
+    ``with`` block exits.
+    """
+
+    __slots__ = ("_conn", "_end_snapshot", "_commit_within", "_state")
+
+    def __init__(
+        self,
+        conn: Any,
+        end_snapshot: int,
+        commit_within: CommitWithinFn,
+    ) -> None:
+        self._conn = conn
+        self._end_snapshot = end_snapshot
+        self._commit_within = commit_within
+        # one of "fresh", "open", "closed"
+        self._state = "fresh"
+
+    @property
+    def connection(self) -> Any:
+        """The consumer's underlying DuckDB connection.
+
+        Use ``execute`` / ``executemany`` on the transaction object for
+        most cases; the raw connection is exposed for callers that need
+        DuckDB APIs not proxied here (Arrow ingestion, prepared
+        statements, etc.). Anything you run on this connection inside
+        the ``with`` block is part of the same BEGIN.
+        """
+        return self._conn
+
+    def execute(self, sql: str, parameters: Any = None) -> Any:
+        if parameters is None:
+            return self._conn.execute(sql)
+        return self._conn.execute(sql, parameters)
+
+    def executemany(self, sql: str, parameters: Iterable[Any]) -> Any:
+        return self._conn.executemany(sql, parameters)
+
+    def __enter__(self) -> Self:
+        if self._state != "fresh":
+            raise RuntimeError("BatchTransaction is single-use")
+        self._conn.execute("BEGIN")
+        self._state = "open"
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self._state = "closed"
+        if exc_type is not None:
+            try:
+                self._conn.execute("ROLLBACK")
+            except Exception:
+                # Don't mask the in-flight exception; surface the
+                # rollback failure as a chained log instead.
+                pass
+            return None
+        try:
+            self._commit_within(self._conn, self._end_snapshot)
+            self._conn.execute("COMMIT")
+        except Exception:
+            try:
+                self._conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        return None
 
 
 @dataclass(frozen=True)
@@ -163,9 +263,22 @@ class DDLTick:
 class DMLBatch:
     """A pre-commit window of DML changes.
 
-    Call ``commit()`` after successful processing. ``batch_id`` is stable
-    across retries: a batch with the same ``(consumer_name, start_snapshot,
-    end_snapshot)`` tuple has the same ``batch_id``.
+    Hand the batch to a sink and finish with one of two patterns:
+
+    - ``with batch.transaction() as tx:`` -- atomic sink-write +
+      cdc_commit. The recommended path for non-idempotent sinks (plain
+      INSERTs, external writes, anything where replay would duplicate).
+      ``ROLLBACK`` on exception, ``cdc_commit`` + ``COMMIT`` on
+      success, both on the consumer's lease-holding connection.
+    - ``batch.commit()`` -- bare cursor advance, no transaction. Use
+      this only for sinks that are idempotent on
+      ``(snapshot_id, table_id, rowid, kind)`` (writing to an OLAP
+      sink with that as a primary key, posting to an idempotent HTTP
+      endpoint, etc.).
+
+    ``batch_id`` is stable across retries: a batch with the same
+    ``(consumer_name, start_snapshot, end_snapshot)`` tuple has the
+    same ``batch_id``.
     """
 
     consumer_name: str
@@ -176,6 +289,10 @@ class DMLBatch:
     received_at: datetime
     changes: tuple[Change, ...]
     _commit: CommitFn = field(default=_unbound_commit, repr=False, compare=False)
+    _commit_within: CommitWithinFn = field(
+        default=_unbound_commit_within, repr=False, compare=False
+    )
+    _connection: Any = field(default=None, repr=False, compare=False)
 
     def __iter__(self) -> Iterator[Change]:
         return iter(self.changes)
@@ -187,7 +304,36 @@ class DMLBatch:
     def derive_batch_id(consumer_name: str, start_snapshot: int, end_snapshot: int) -> str:
         return f"{consumer_name}/{start_snapshot}-{end_snapshot}"
 
+    def transaction(self) -> BatchTransaction:
+        """Atomic sink-write + cursor advance on the consumer's connection.
+
+        See :class:`BatchTransaction` for the lifecycle. Use this
+        whenever your sink isn't idempotent::
+
+            for batch in consumer.batches(stop_event=stop):
+                with batch.transaction() as tx:
+                    tx.executemany(
+                        "INSERT INTO sink VALUES (...)",
+                        rows_for(batch),
+                    )
+        """
+        if self._connection is None:
+            raise RuntimeError(
+                "batch.transaction() requires the batch to be created by an "
+                "open consumer; this batch has no bound connection"
+            )
+        return BatchTransaction(self._connection, self.end_snapshot, self._commit_within)
+
     def commit(self) -> None:
+        """Advance the consumer cursor to ``end_snapshot`` (no transaction).
+
+        Idempotent-sink path. Runs ``cdc_commit`` on the consumer's
+        connection without wrapping it in a BEGIN -- there's no sink
+        write to keep atomic with it because your sink either dedupes
+        on replay or doesn't care about exactly-once.
+
+        For non-idempotent sinks, use :meth:`transaction` instead.
+        """
         self._commit(self.end_snapshot)
 
 
@@ -196,9 +342,8 @@ class DDLBatch:
     """A pre-commit window of DDL events.
 
     Structurally identical to :class:`DMLBatch` but parameterized over
-    :class:`SchemaChange`. ``batch_id`` is stable across retries: a batch
-    with the same ``(consumer_name, start_snapshot, end_snapshot)`` tuple
-    has the same ``batch_id``.
+    :class:`SchemaChange`. See :class:`DMLBatch` for the
+    ``transaction()`` / ``commit()`` lifecycle.
     """
 
     consumer_name: str
@@ -209,6 +354,10 @@ class DDLBatch:
     received_at: datetime
     changes: tuple[SchemaChange, ...]
     _commit: CommitFn = field(default=_unbound_commit, repr=False, compare=False)
+    _commit_within: CommitWithinFn = field(
+        default=_unbound_commit_within, repr=False, compare=False
+    )
+    _connection: Any = field(default=None, repr=False, compare=False)
 
     def __iter__(self) -> Iterator[SchemaChange]:
         return iter(self.changes)
@@ -220,7 +369,17 @@ class DDLBatch:
     def derive_batch_id(consumer_name: str, start_snapshot: int, end_snapshot: int) -> str:
         return f"{consumer_name}/{start_snapshot}-{end_snapshot}"
 
+    def transaction(self) -> BatchTransaction:
+        """See :meth:`DMLBatch.transaction`."""
+        if self._connection is None:
+            raise RuntimeError(
+                "batch.transaction() requires the batch to be created by an "
+                "open consumer; this batch has no bound connection"
+            )
+        return BatchTransaction(self._connection, self.end_snapshot, self._commit_within)
+
     def commit(self) -> None:
+        """See :meth:`DMLBatch.commit`."""
         self._commit(self.end_snapshot)
 
 
@@ -236,6 +395,10 @@ class DMLTickBatch:
     received_at: datetime
     ticks: tuple[DMLTick, ...]
     _commit: CommitFn = field(default=_unbound_commit, repr=False, compare=False)
+    _commit_within: CommitWithinFn = field(
+        default=_unbound_commit_within, repr=False, compare=False
+    )
+    _connection: Any = field(default=None, repr=False, compare=False)
 
     def __iter__(self) -> Iterator[DMLTick]:
         return iter(self.ticks)
@@ -247,7 +410,17 @@ class DMLTickBatch:
     def derive_batch_id(consumer_name: str, start_snapshot: int, end_snapshot: int) -> str:
         return f"{consumer_name}/{start_snapshot}-{end_snapshot}"
 
+    def transaction(self) -> BatchTransaction:
+        """See :meth:`DMLBatch.transaction`."""
+        if self._connection is None:
+            raise RuntimeError(
+                "batch.transaction() requires the batch to be created by an "
+                "open consumer; this batch has no bound connection"
+            )
+        return BatchTransaction(self._connection, self.end_snapshot, self._commit_within)
+
     def commit(self) -> None:
+        """See :meth:`DMLBatch.commit`."""
         self._commit(self.end_snapshot)
 
 
@@ -263,6 +436,10 @@ class DDLTickBatch:
     received_at: datetime
     ticks: tuple[DDLTick, ...]
     _commit: CommitFn = field(default=_unbound_commit, repr=False, compare=False)
+    _commit_within: CommitWithinFn = field(
+        default=_unbound_commit_within, repr=False, compare=False
+    )
+    _connection: Any = field(default=None, repr=False, compare=False)
 
     def __iter__(self) -> Iterator[DDLTick]:
         return iter(self.ticks)
@@ -274,7 +451,17 @@ class DDLTickBatch:
     def derive_batch_id(consumer_name: str, start_snapshot: int, end_snapshot: int) -> str:
         return f"{consumer_name}/{start_snapshot}-{end_snapshot}"
 
+    def transaction(self) -> BatchTransaction:
+        """See :meth:`DMLBatch.transaction`."""
+        if self._connection is None:
+            raise RuntimeError(
+                "batch.transaction() requires the batch to be created by an "
+                "open consumer; this batch has no bound connection"
+            )
+        return BatchTransaction(self._connection, self.end_snapshot, self._commit_within)
+
     def commit(self) -> None:
+        """See :meth:`DMLBatch.commit`."""
         self._commit(self.end_snapshot)
 
 

@@ -24,7 +24,7 @@ wheels = [
 
 [[package]]
 name = "ducklake-cdc-client"
-version = "0.1.0"
+version = "0.1.2"
 source = { editable = "." }
 dependencies = [
     { name = "ducklake-client" },
@@ -45,7 +45,7 @@ polars = [
 
 [package.metadata]
 requires-dist = [
-    { name = "ducklake-client", specifier = ">=0.1.1" },
+    { name = "ducklake-client", specifier = ">=0.1.2" },
     { name = "pandas", marker = "extra == 'pandas'" },
     { name = "polars", marker = "extra == 'polars'" },
     { name = "pyarrow", marker = "extra == 'arrow'" },
@@ -56,14 +56,14 @@ provides-extras = ["arrow", "pandas", "polars"]
 
 [[package]]
 name = "ducklake-client"
-version = "0.1.1"
+version = "0.1.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "duckdb" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/eb/d9/bcff1b00c0a652d75fa631d222b88ccdad6ff69b59e6473172d739ba1638/ducklake_client-0.1.1.tar.gz", hash = "sha256:2551e0320f97c130eca7d1c8807114de320e8ce9d5e4fd65e434ea30ab90f730", size = 14300, upload-time = "2026-05-05T11:49:26.508Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/3d/d5/836500e3a8d1e8df51deca669881d8771550f18de7066e2723ef1f08608d/ducklake_client-0.1.2.tar.gz", hash = "sha256:bfa99d8078290ad1565ea280784603cae6ce748d387c57dc66690ff11250c3d2", size = 14625, upload-time = "2026-05-05T14:45:22.251Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/da/77/5ab04082e3c41ed225fbd2f930312902cd1138f5b7368f82e2d8f200c242/ducklake_client-0.1.1-py3-none-any.whl", hash = "sha256:3701b29800d1086569b8cb75325391014af38f5869bfec1179c35d577bec50b4", size = 25469, upload-time = "2026-05-05T11:49:25.672Z" },
+    { url = "https://files.pythonhosted.org/packages/ab/39/c13b4aac1fbd316b92063330de8b8b560261c2c58ed11434398f5591325c/ducklake_client-0.1.2-py3-none-any.whl", hash = "sha256:8cad6780ddd2f1a9ca86d0d8e0dc6e16f9ce3141c0049ef72eb342e37202ff09", size = 25792, upload-time = "2026-05-05T14:45:21.027Z" },
 ]
 
 [[package]]

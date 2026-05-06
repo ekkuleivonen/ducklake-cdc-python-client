@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
+from typing import Any
 
 from ducklake_client import DuckLake
 
-from ducklake_cdc_client.client import CDCClient, ChangeRow, DMLTickRow
+from ducklake_cdc_client.client import CDCClient, ChangeRow, DMLTickRow, SchemaDiffRow
 from ducklake_cdc_client.consumers.base import (
     _DEFAULT_LEASE_WAIT_TIMEOUT,
     ConsumerMode,
@@ -41,6 +42,7 @@ class DMLConsumer(_ConsumerBase):
         lease_wait_timeout: float = _DEFAULT_LEASE_WAIT_TIMEOUT,
         sinks: Sequence[SinkLike] = (),
         client: CDCClient | None = None,
+        connection: Any | None = None,
         retry: RetryPolicy | None = None,
     ) -> None:
         super().__init__(
@@ -53,6 +55,7 @@ class DMLConsumer(_ConsumerBase):
             lease_wait_timeout=lease_wait_timeout,
             sinks=sinks,
             client=client,
+            connection=connection,
             retry=retry,
         )
         if (table is None) == (table_id is None):
@@ -70,11 +73,98 @@ class DMLConsumer(_ConsumerBase):
             table_name=self._table,
             table_id=self._table_id,
             change_types=self._change_types,
-            start_at="now",
+            start_at=self._start_at,
         )
 
+    def schema_diff(
+        self,
+        *,
+        from_snapshot: int | None = None,
+        to_snapshot: int | None = None,
+        max_snapshots: int = 100,
+    ) -> list[SchemaDiffRow]:
+        """Return schema diff rows for this consumer's terminal boundary."""
+
+        self._require_open()
+        if from_snapshot is None or to_snapshot is None:
+            window = self.window(max_snapshots=max_snapshots)
+            boundary = window.terminal_at_snapshot
+            if boundary is None:
+                raise RuntimeError(
+                    f"consumer {self._name!r} has no schema boundary to diff"
+                )
+            from_snapshot = boundary
+            to_snapshot = boundary
+        schema_name, table_name = self._schema_diff_table()
+        return self._require_client().schema.diff(
+            schema_name,
+            table_name,
+            from_snapshot,
+            to_snapshot,
+        )
+
+    def successor(
+        self,
+        name: str,
+        *,
+        start_at: StartAt | None = None,
+        max_snapshots: int = 100,
+        on_exists: OnExists = "error",
+        lease_policy: LeasePolicy | None = None,
+        lease_wait_timeout: float | None = None,
+        sinks: Sequence[SinkLike] = (),
+    ) -> DMLConsumer:
+        """Create a successor consumer object positioned at this schema boundary."""
+
+        self._require_open()
+        if start_at is None:
+            window = self.window(max_snapshots=max_snapshots)
+            if not window.terminal or window.terminal_at_snapshot is None:
+                raise RuntimeError(
+                    f"consumer {self._name!r} is not stopped at a schema boundary"
+                )
+            start_at = window.terminal_at_snapshot
+        return DMLConsumer(
+            self._lake,
+            name,
+            table=self._table,
+            table_id=self._table_id,
+            change_types=self._change_types,
+            start_at=start_at,
+            mode=self._mode,
+            on_exists=on_exists,
+            lease_policy=lease_policy or self._lease_policy,
+            lease_wait_timeout=(
+                self._lease_wait_timeout
+                if lease_wait_timeout is None
+                else lease_wait_timeout
+            ),
+            sinks=sinks,
+            connection=self._connection_override,
+            retry=self._retry_policy,
+        )
+
+    def _schema_diff_table(self) -> tuple[str, str]:
+        table_name = self._table
+        if table_name is None:
+            entry = self._lookup_consumer(self._require_client())
+            table_name = entry.table_name if entry is not None else None
+        if table_name is None:
+            raise RuntimeError(
+                "schema_diff() requires a table name; table_id consumers need "
+                "an existing consumer list entry with table_name"
+            )
+        parts = table_name.split(".", 1)
+        if len(parts) == 2:
+            return parts[0], parts[1]
+        return self._require_client().catalog, table_name
+
     def _listen_op(
-        self, timeout_ms: int, max_snapshots: int
+        self,
+        timeout_ms: int,
+        max_snapshots: int,
+        poll_min_ms: int | None,
+        coalesce: bool | None,
     ) -> Callable[[], list[ChangeRow] | list[DMLTickRow]]:
         client = self._require_client()
         name = self._name
@@ -85,11 +175,15 @@ class DMLConsumer(_ConsumerBase):
                     name,
                     timeout_ms=timeout_ms,
                     max_snapshots=max_snapshots,
+                    poll_min_ms=poll_min_ms,
+                    coalesce=coalesce,
                 )
             return client.cdc_dml_changes_listen(
                 name,
                 timeout_ms=timeout_ms,
                 max_snapshots=max_snapshots,
+                poll_min_ms=poll_min_ms,
+                coalesce=coalesce,
             )
 
         return operation
@@ -156,6 +250,8 @@ class DMLConsumer(_ConsumerBase):
             received_at=datetime.now(UTC),
             changes=changes,
             _commit=self._commit_snapshot,
+            _commit_within=self._commit_snapshot_within,
+            _connection=self._connection,
         )
 
     def _build_tick_batch(self, rows: list[DMLTickRow]) -> DMLTickBatch:
@@ -186,4 +282,6 @@ class DMLConsumer(_ConsumerBase):
             received_at=datetime.now(UTC),
             ticks=ticks,
             _commit=self._commit_snapshot,
+            _commit_within=self._commit_snapshot_within,
+            _connection=self._connection,
         )
